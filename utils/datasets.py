@@ -11,6 +11,8 @@ from utils.augmentations import horisontal_flip
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 def pad_to_square(img, pad_value):
     c, h, w = img.shape
@@ -26,7 +28,11 @@ def pad_to_square(img, pad_value):
 
 
 def resize(image, size):
-    image = F.interpolate(image.unsqueeze(0), size=size, mode="nearest").squeeze(0)
+    # image = F.interpolate(image.unsqueeze(0), size=size, mode="nearest").squeeze(0)
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    #-- changed the above interpolation from nearest to bilinear
+    image = F.interpolate(image.unsqueeze(0), size=size, mode="bilinear" , align_corners = False).squeeze(0)
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
     return image
 
 
@@ -37,14 +43,17 @@ def random_resize(images, min_size=288, max_size=448):
 
 
 class ImageFolder(Dataset):
-    def __init__(self, folder_path, img_size=416):
+    def __init__(self, folder_path, img_size=608):
         self.files = sorted(glob.glob("%s/*.*" % folder_path))
         self.img_size = img_size
 
     def __getitem__(self, index):
         img_path = self.files[index % len(self.files)]
         # Extract image as PyTorch tensor
+# -----------------------------------------------------------------------------------------
+# Why it is not converted to RGB as it was done in ListDataset
         img = transforms.ToTensor()(Image.open(img_path))
+# -----------------------------------------------------------------------------------------
         # Pad to square resolution
         img, _ = pad_to_square(img, 0)
         # Resize
@@ -62,7 +71,7 @@ class ListDataset(Dataset):
             self.img_files = file.readlines()
 
         self.label_files = [
-            path.replace("images", "labels").replace(".png", ".txt").replace(".jpg", ".txt")
+            path.replace("images", "labels").replace(".png", ".txt").replace(".jpg", ".txt").replace("JPEGImages","labels")
             for path in self.img_files
         ]
         self.img_size = img_size
@@ -70,8 +79,8 @@ class ListDataset(Dataset):
         self.augment = augment
         self.multiscale = multiscale
         self.normalized_labels = normalized_labels
-        self.min_size = self.img_size - 3 * 32
-        self.max_size = self.img_size + 3 * 32
+        self.min_size = 320
+        self.max_size = 608
         self.batch_count = 0
 
     def __getitem__(self, index):
@@ -110,11 +119,14 @@ class ListDataset(Dataset):
             y1 = h_factor * (boxes[:, 2] - boxes[:, 4] / 2)
             x2 = w_factor * (boxes[:, 1] + boxes[:, 3] / 2)
             y2 = h_factor * (boxes[:, 2] + boxes[:, 4] / 2)
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
             # Adjust for added padding
             x1 += pad[0]
             y1 += pad[2]
-            x2 += pad[1]
-            y2 += pad[3]
+            x2 += pad[0]              #pad[1]  modified
+            y2 += pad[2]              #pad[3]  modified
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
             # Returns (x, y, w, h)
             boxes[:, 1] = ((x1 + x2) / 2) / padded_w
             boxes[:, 2] = ((y1 + y2) / 2) / padded_h
@@ -125,22 +137,34 @@ class ListDataset(Dataset):
             targets[:, 1:] = boxes
 
         # Apply augmentations
+# --------------------------------------------------------------------------------------------
+        #-- Try to even incorporate hue saturation and exposure variations
         if self.augment:
             if np.random.random() < 0.5:
                 img, targets = horisontal_flip(img, targets)
 
+# --------------------------------------------------------------------------------------------
         return img_path, img, targets
 
     def collate_fn(self, batch):
         paths, imgs, targets = list(zip(*batch))
-        # Remove empty placeholder targets
-        targets = [boxes for boxes in targets if boxes is not None]
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+#-- First wrote index to all the targets and then removed the none objects
+#-- What was happening before this is : It was removing the none objects before writing index
+#-- and because of that one image was getting others targets as images with no targets weren't removed
         # Add sample index to targets
         for i, boxes in enumerate(targets):
-            boxes[:, 0] = i
+            if(boxes is not None):
+                boxes[:, 0] = i
+        # Remove empty placeholder targets
+        targets = [boxes for boxes in targets if boxes is not None]
+# ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
         targets = torch.cat(targets, 0)
         # Selects new image size every tenth batch
-        if self.multiscale and self.batch_count % 10 == 0:
+        if self.batch_count > 600000:
+            print("Final Training for maximum Image Size 608")
+            self.img_size = self.max_size
+        elif (self.multiscale and (self.batch_count % 10 == 0)):
             self.img_size = random.choice(range(self.min_size, self.max_size + 1, 32))
         # Resize images to input shape
         imgs = torch.stack([resize(img, self.img_size) for img in imgs])
